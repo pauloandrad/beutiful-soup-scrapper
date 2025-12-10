@@ -1,14 +1,14 @@
-from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+from datetime import datetime
 from bs4 import BeautifulSoup
 
+import sqlite3
+import pytz
 import os
-import re
 
 load_dotenv()
 
-GUIDE_BASE_URL = "https://hoko.com.co/admin/resources/guides/"
-OUTPUT_FILE = "/hoko_guias_links.csv"
 COOKIES = [
     {
         "name": "hoko_colombia_session",
@@ -28,11 +28,14 @@ COOKIES = [
     }
 ]
 
-def get_value_by_dusk(soup, dusk, class_name=None):
+def get_value_by_dusk(soup, dusk, element=None, class_name=None):
     row = soup.find('div', attrs={'dusk': dusk})
 
     if row:
-        container = row.find('div', class_=lambda c: c and 'md:w-3/4' in c)
+        class_to_find = class_name or 'md:w-3/4'
+        element_to_find = element or 'div'
+
+        container = row.find(element_to_find, class_=lambda c: c and class_to_find in c)
 
         if container:
             return container.get_text(strip=True)
@@ -87,7 +90,109 @@ def get_status_list(soup):
 
     return status_list
 
+def format_date_time(date_str):
+    date_str = date_str.replace('Creación: ', '').replace('noviembre', 'November')
+    date_format = "%d %B %Y %H:%M:%S"
+    date_obj = datetime.strptime(date_str, date_format)
+
+    gmt_minus_5 = pytz.timezone('US/Eastern')
+    date_obj_gmt_5 = gmt_minus_5.localize(date_obj)
+
+    gmt_minus_3 = pytz.timezone('America/Sao_Paulo')
+    return date_obj_gmt_5.astimezone(gmt_minus_3)
+
+def get_order(soup):
+    return {
+        'id': get_value_by_dusk(soup, 'id'),
+        'estado': get_value_by_dusk(soup, 'ComputedField'),
+        'numero_guia': get_value_by_dusk(soup, 'number'),
+        'fecha_creacion': format_date_time(get_value_by_dusk(soup, 'fechas', 'span', 'font-semibold')),
+        'bodega': get_value_by_dusk(soup, 'throughCellar'),
+        'transportadora': get_value_by_dusk(soup, 'transportadora'),
+        'tienda': get_value_by_dusk(soup, 'throughStore'),
+        'productos': get_value_by_dusk(soup, 'productos'),
+        'orden_id': get_value_by_dusk(soup, 'order'),
+    }
+
+def insert_status_history(history, guide_id):
+    conn = sqlite3.connect(os.getenv("GUIDE_DB"))
+    cursor = conn.cursor()
+
+    for status in history:
+        update_date = datetime.strptime(status['fecha_y_hora'], '%m/%d/%Y, %I:%M %p GMT-5')
+
+        cursor.execute('''
+               INSERT INTO historial_estados (guia_id, estado, comentarios, fecha_y_hora, creado_por)
+               VALUES (?, ?, ?, ?, ?)
+               ''', (
+            guide_id,
+            status['estado'],
+            status['comentarios'],
+            update_date,
+            status['creado_por']
+        ))
+
+    conn.commit()
+    conn.close()
+
+def insert_order_into_db(order_data):
+    conn = sqlite3.connect(os.getenv("GUIDE_DB"))
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    INSERT INTO guias (id, estado, numero_guia, fecha_creacion, bodega, transportadora, tienda, productos, orden_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        order_data['id'],
+        order_data['estado'],
+        order_data['numero_guia'],
+        order_data['fecha_creacion'],
+        order_data['bodega'],
+        order_data['transportadora'],
+        order_data['tienda'],
+        order_data['productos'],
+        order_data['orden_id']
+    ))
+
+    conn.commit()
+    conn.close()
+
+def create_sqlite_db():
+    conn = sqlite3.connect(os.getenv("GUIDE_DB"))
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS guias (
+        id INTEGER PRIMARY KEY,
+        estado TEXT,
+        numero_guia TEXT,
+        fecha_creacion DATETIME,
+        bodega TEXT,
+        transportadora TEXT,
+        tienda TEXT,
+        productos TEXT,
+        orden_id TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS historial_estados (
+        id INTEGER PRIMARY KEY,
+        guia_id INTEGER,
+        estado TEXT,
+        comentarios TEXT,
+        fecha_y_hora DATETIME,
+        creado_por TEXT,
+        FOREIGN KEY (guia_id) REFERENCES guias (id)
+    )
+    ''')
+
+    conn.commit()
+    conn.close()
+
 def extract_guide_data():
+    create_sqlite_db()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
 
@@ -95,33 +200,19 @@ def extract_guide_data():
         context.add_cookies(COOKIES)
 
         page = context.new_page()
-        page.goto(GUIDE_BASE_URL + "1774435")
+        page.goto(os.getenv('GUIDE_BASE_URL') + "1774435")
 
         page.wait_for_selector('[dusk="id"]')
         page.wait_for_selector('[dusk="resource-table"]')
 
         html = page.content()
-
         soup = BeautifulSoup(html, 'html.parser')
-
-        order = {
-            'id': get_value_by_dusk(soup, 'id'),
-            'estado': get_value_by_dusk(soup, 'ComputedField'),
-            'numero_guia': get_value_by_dusk(soup, 'number'),
-            'fecha_creacion': get_value_by_dusk(soup, 'fechas'),
-            'bodega': get_value_by_dusk(soup, 'throughCellar'),
-            'transportadora': get_value_by_dusk(soup, 'transportadora'),
-            'tienda': get_value_by_dusk(soup, 'throughStore'),
-            'productis': get_value_by_dusk(soup, 'productos'),
-            'orden_id': get_value_by_dusk(soup, 'order'),
-        }
+        order = get_order(soup)
 
         status_list = get_status_list(soup)
 
-        print(status_list)
-
-        with open("./output/teste.html", 'w', encoding='utf-8') as file:
-            file.write(html)
+        insert_order_into_db(order)
+        insert_status_history(status_list, order['id'])
 
         browser.close()
 
