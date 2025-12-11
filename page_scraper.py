@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+import pandas as pd
 import sqlite3
 import pytz
 import os
@@ -93,13 +94,8 @@ def get_status_list(soup):
 def format_date_time(date_str):
     date_str = date_str.replace('Creación: ', '').replace('noviembre', 'November')
     date_format = "%d %B %Y %H:%M:%S"
-    date_obj = datetime.strptime(date_str, date_format)
 
-    gmt_minus_5 = pytz.timezone('US/Eastern')
-    date_obj_gmt_5 = gmt_minus_5.localize(date_obj)
-
-    gmt_minus_3 = pytz.timezone('America/Sao_Paulo')
-    return date_obj_gmt_5.astimezone(gmt_minus_3)
+    return datetime.strptime(date_str, date_format)
 
 def get_order(soup):
     return {
@@ -158,9 +154,6 @@ def insert_order_into_db(order_data):
     conn.close()
 
 def create_sqlite_db():
-    conn = sqlite3.connect(os.getenv("GUIDE_DB"))
-    cursor = conn.cursor()
-
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS guias (
         id INTEGER PRIMARY KEY,
@@ -188,11 +181,18 @@ def create_sqlite_db():
     ''')
 
     conn.commit()
-    conn.close()
 
-def extract_guide_data():
-    create_sqlite_db()
 
+def get_last_inserted_guide_id():
+    sql = "SELECT MAX(id) FROM guias"
+
+    cursor.execute(sql)
+
+    max_guide_id= cursor.fetchone()
+
+    return max_guide_id[0] if max_guide_id else 0
+
+def extract_guide_data(guide_ids):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
 
@@ -200,28 +200,41 @@ def extract_guide_data():
         context.add_cookies(COOKIES)
 
         page = context.new_page()
-        page.goto(os.getenv('GUIDE_BASE_URL') + "1774435")
 
-        page.wait_for_selector('[dusk="id"]')
-        page.wait_for_selector('[dusk="resource-table"]')
+        get_last_inserted_guide_id()
 
-        html = page.content()
-        soup = BeautifulSoup(html, 'html.parser')
-        order = get_order(soup)
+        for guide_id in guide_ids:
+            page.goto(os.getenv('GUIDE_BASE_URL') + str(guide_id))
 
-        status_list = get_status_list(soup)
+            try:
+                page.wait_for_selector('[dusk="id"]', timeout=5000)
+                page.wait_for_selector('[dusk="resource-table"]', timeout=5000)
+            except Exception as e:
+                print(f"Seletor '[dusk=\"id\"]' não encontrado para o guia {guide_id}. Continuando...")
+                continue
 
-        insert_order_into_db(order)
-        insert_status_history(status_list, order['id'])
+            html = page.content()
+            soup = BeautifulSoup(html, 'html.parser')
+            order = get_order(soup)
+
+            status_list = get_status_list(soup)
+
+            insert_order_into_db(order)
+            insert_status_history(status_list, order['id'])
 
         browser.close()
 
 if __name__ == "__main__":
-    ids = [1774435]
+    conn = sqlite3.connect(os.getenv("GUIDE_DB"))
+    cursor = conn.cursor()
 
-    extract_guide_data()
+    create_sqlite_db()
 
+    max_id = get_last_inserted_guide_id()
 
+    df_col_guides = pd.read_csv('./colombia/1765406867-guides.csv')
+    ids = [id for id in df_col_guides['ID'] if id > max_id]
 
+    extract_guide_data(ids)
 
-
+    conn.close()
